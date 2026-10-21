@@ -84,6 +84,7 @@ PR_ACCEPTANCE_TARGETS = [
     "tests/integration/tools/test_func_tools_db.py",
     "tests/integration/tools/test_dosi_attribution.py",
     "tests/integration/tools/test_dosi_query_filters.py",
+    "tests/integration/tools/test_dosi_ontology.py",
     "tests/integration/tools/test_mcp_acceptance.py",
     "tests/integration/tools/db_tools/test_connector_duckdb.py",
     "tests/unit_tests/storage/test_feedback_store.py",
@@ -377,7 +378,10 @@ def _build_pytest_command(
         # Distribute the suite across pytest-xdist workers so the suites stay
         # under TEST_CMD_TIMEOUT; pytest-cov merges per-worker data.
         # By default, use half of the available CPUs; runners may override this.
-        cmd.extend(["-n", PARALLEL_WORKERS])
+        # loadfile/loadscope can requeue completed work as empty units after a
+        # worker crash (pytest-xdist#1378), leaving the session waiting forever.
+        # Preserve the crash as a failure rather than attempting recovery.
+        cmd.extend(["-n", PARALLEL_WORKERS, "--max-worker-restart=0"])
         if dist:
             cmd.extend(["--dist", dist])
 

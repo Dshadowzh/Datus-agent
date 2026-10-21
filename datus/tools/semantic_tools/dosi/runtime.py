@@ -20,7 +20,7 @@ import asyncio
 import hashlib
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import yaml
 
@@ -31,6 +31,7 @@ from datus.tools.semantic_tools.dosi.dialects import resolve_engine_dialect
 from datus.tools.semantic_tools.dosi.engine import (
     EngineHandle,
     EngineRegistry,
+    binding_supports_ontology,
     datus_extension_version,
     load_binding,
 )
@@ -39,6 +40,7 @@ from datus.tools.semantic_tools.dosi.errors import (
     raise_mapped,
 )
 from datus.tools.semantic_tools.dosi.model import (
+    document_model_names,
     iter_semantic_models,
     load_document,
     metric_payloads,
@@ -132,6 +134,7 @@ class DosiRuntime:
                 metadata: Dict[str, Any] = {
                     "datasets": list(row.get("datasets") or []),
                     "base_kind": row.get("kind"),
+                    "required_dimensions": list(row.get("required_dimensions") or []),
                     "datus_ext_version": extension_version,
                 }
                 for key in ("params", "param_schema"):
@@ -171,6 +174,7 @@ class DosiRuntime:
                         str(row.get("name") or ""),
                         dialect=dialect,
                         connection=connection,
+                        required_dimensions=list(row.get("required_dimensions") or []),
                     )
                     metadata.update(
                         {
@@ -223,6 +227,7 @@ class DosiRuntime:
         metric_rows = await asyncio.to_thread(engine.metrics)
         dataset_rows = await asyncio.to_thread(engine.datasets)
         metric_row = next(row for row in metric_rows if row.get("name") == metric_name)
+        required_dimensions = list(metric_row.get("required_dimensions") or [])
         connection = handle.profile_name
         dialect = self._dry_run_dialect(binding, connection)
 
@@ -233,6 +238,7 @@ class DosiRuntime:
             metric_name,
             dialect=dialect,
             connection=connection,
+            required_dimensions=required_dimensions,
         )
         physical_time_dimension = self._effective_time_dimension(
             metric_row,
@@ -251,6 +257,7 @@ class DosiRuntime:
                 grains: List[str] = []
                 for grain in queryable_grains(row.get("time_granularity")):
                     group_by = [{"field": name, "grain": grain}]
+                    group_by.extend({"field": dim} for dim in required_dimensions if dim != name)
                     if requires_time_axis and name not in {
                         "metric_time",
                         physical_time_dimension,
@@ -295,14 +302,23 @@ class DosiRuntime:
             return supported
 
         grains_by_name = await asyncio.to_thread(_time_grains)
+        primary_time = "metric_time" if has_metric_time else physical_time_dimension
+        required_time = primary_time if requires_time_axis else None
         return [
             DimensionInfo(
                 name=str(row.get("name") or ""),
                 description=row.get("description") or None,
-                type="time" if row.get("is_time") else None,
-                is_primary_time=bool(
-                    row.get("name") == "metric_time" if has_metric_time else row.get("name") == physical_time_dimension
+                required=row.get("name") in required_dimensions or row.get("name") == required_time,
+                required_reason=(
+                    "time_axis"
+                    if row.get("name") == required_time
+                    else "metric_definition"
+                    if row.get("name") in required_dimensions
+                    else None
                 ),
+                time_axis_required=row.get("name") == required_time,
+                type="time" if row.get("is_time") else None,
+                is_primary_time=row.get("name") == primary_time,
                 time_granularities=(grains_by_name.get(str(row.get("name") or ""), []) if row.get("is_time") else []),
                 recommended=row.get("is_dimension"),
                 recommendation_source=(str(row.get("source")) if row.get("source") is not None else None),
@@ -390,6 +406,11 @@ class DosiRuntime:
         # Fetched off the event loop; _build_query stays pure (no engine I/O).
         dimension_rows = await asyncio.to_thread(engine.dimensions)
         metric_rows = await asyncio.to_thread(engine.metrics)
+        dataset_names: List[str] = []
+        if handle.has_ontology:
+            dataset_names = await asyncio.to_thread(lambda: [str(row.get("name")) for row in engine.datasets()])
+            concept_time = await asyncio.to_thread(self._concept_time_dimensions, engine, dimensions)
+            dimension_rows = [*dimension_rows, *({"name": name, "is_time": True} for name in sorted(concept_time))]
 
         query = self._build_query(
             dimension_rows,
@@ -405,7 +426,22 @@ class DosiRuntime:
             params=params,
             context_filter=context_filter,
         )
+        time_fields = self._query_time_dimensions(dimension_rows, dimensions)
+        # Reuse the engine's field roles and the exact grains sent in this query.
+        # A missing grain means raw time keys; do not infer a coarser bucket.
+        time_dimensions = {
+            item["field"]: item.get("grain") for item in query["group_by"] if item["field"] in time_fields
+        }
         connection = handle.profile_name
+        if handle.has_ontology:
+            query = await asyncio.to_thread(
+                self._order_by_requested_columns,
+                query,
+                dimensions,
+                engine.compile,
+                self._dry_run_dialect(binding, connection),
+                connection,
+            )
         try:
             if dry_run:
                 compiled = await asyncio.to_thread(
@@ -425,6 +461,7 @@ class DosiRuntime:
                         "dialect": compiled["dialect"],
                         "dry_run": True,
                         "explain": True,
+                        "time_dimensions": time_dimensions,
                         **({"outputs": compiled["outputs"]} if compiled.get("outputs") is not None else {}),
                     },
                 )
@@ -434,14 +471,23 @@ class DosiRuntime:
                 connection=connection,
                 timeout_secs=float(self.config.timeout_seconds),
             )
+            columns, rows = list(result["columns"]), list(result["rows"])
+            if handle.has_ontology:
+                columns, rows = self._label_requested_columns(result, dataset_names)
             return QueryResult(
-                columns=list(result["columns"]),
-                data=list(result["rows"]),
+                columns=columns,
+                data=rows,
                 metadata={
                     "sql": result["sql"],
                     "dialect": result["dialect"],
                     "row_count": result["row_count"],
+                    "time_dimensions": time_dimensions,
                     **({"outputs": result["outputs"]} if result.get("outputs") is not None else {}),
+                    **(
+                        {"requested_columns": result["requested_columns"]}
+                        if result.get("requested_columns") is not None
+                        else {}
+                    ),
                 },
             )
         except Exception as exc:  # noqa: BLE001 - mapped to typed errors below
@@ -455,6 +501,234 @@ class DosiRuntime:
                 requested_time_granularity=time_granularity,
             )
             raise  # unreachable; raise_mapped always raises
+
+    # ==================== Ontology Interface ====================
+
+    def ontology_handles(self) -> List[tuple[str, EngineHandle]]:
+        """Model files that load with a paired ontology, in catalog order."""
+        handles, _, _ = self._catalog()
+        return [(path, handle) for path, handle in handles if handle.has_ontology]
+
+    def has_ontology(self) -> bool:
+        """Whether any engine of this datasource loads an ontology."""
+        return bool(self.ontology_handles())
+
+    def unpaired_ontologies(self) -> List[str]:
+        """Ontology files present for the datasource that pair with no model file."""
+        self._catalog()
+        return self._registry.unpaired_ontologies()
+
+    def ontology_info(self) -> List[Dict[str, Any]]:
+        """``Engine.ontology_info()`` per ontology-backed model file."""
+        infos: List[Dict[str, Any]] = []
+        for model_path, handle in self.ontology_handles():
+            engine = handle.get()
+            info_fn = getattr(engine, "ontology_info", None)
+            info = info_fn() if callable(info_fn) else None
+            infos.append(
+                {
+                    **(dict(info) if isinstance(info, dict) else {"source_path": handle.ontology_source}),
+                    "model_file": model_path,
+                }
+            )
+        return infos
+
+    def _require_ontology_handles(self) -> List[tuple[str, EngineHandle]]:
+        binding = load_binding()
+        if not binding_supports_ontology(binding):
+            raise SemanticCoreException(
+                "the installed dosi-engine binding cannot describe ontologies; "
+                "upgrade dosi-engine to a build whose Engine has describe() and paths()"
+            )
+        handles = self.ontology_handles()
+        if not handles:
+            raise SemanticCoreException(f"no ontology is loaded for datasource {self.datasource!r}")
+        return handles
+
+    def _first_answer(self, call: Any, **request_context: Any) -> Any:
+        """Ask each ontology-backed engine in turn; the first that knows the concept answers.
+
+        Concept names are only unique within one ontology, and a datasource
+        normally has one, so asking in catalog order is the routing rule. When
+        no engine knows the name, the last engine's rejection is raised: it
+        carries the candidates the agent retries with.
+        """
+        binding = load_binding()
+        last_exc: Optional[BaseException] = None
+        for _, handle in self._require_ontology_handles():
+            engine = handle.get()
+            try:
+                return call(engine), handle
+            except binding.QueryError as exc:
+                last_exc = exc
+        assert last_exc is not None
+        raise_mapped(last_exc, binding, **request_context)
+        raise last_exc  # unreachable; raise_mapped always raises
+
+    async def describe(self, name: Optional[str] = None) -> Dict[str, Any]:
+        """The ontology's concept catalog, or one concept's detail.
+
+        Payloads are the engine's own (the same JSON as the Dosi MCP
+        ``describe`` tool). A datasource with several ontology-backed model
+        files returns ``{"ontologies": [catalog, ...]}`` for the catalog.
+        """
+        name = str(name or "").strip() or None
+        if name is None:
+            handles = await asyncio.to_thread(self._require_ontology_handles)
+            catalogs = []
+            for model_path, handle in handles:
+                engine = await asyncio.to_thread(handle.get)
+                catalog = await asyncio.to_thread(engine.describe)
+                catalogs.append({**catalog, "model_file": Path(model_path).name})
+            return catalogs[0] if len(catalogs) == 1 else {"ontologies": catalogs}
+        detail, _ = await asyncio.to_thread(self._first_answer, lambda engine: engine.describe(name))
+        return detail
+
+    async def concept_paths(self, source: str, target: str) -> Dict[str, Any]:
+        """Every named path between two concepts, with roles and equivalences."""
+        result, _ = await asyncio.to_thread(self._first_answer, lambda engine: engine.paths(source, target))
+        return result
+
+    @staticmethod
+    def _order_by_requested_columns(
+        query: Dict[str, Any],
+        requested: List[str],
+        compile_fn: Any,
+        dialect: Optional[str],
+        connection: Optional[str],
+    ) -> Dict[str, Any]:
+        """Rewrite ``order_by`` keys that name a requested concept path to its output column.
+
+        Dosi orders by output column names, while an ontology caller thinks in
+        the concept paths it requested (``FlightAlert.id`` comes back as
+        ``alert_id``). One compile of the unordered query yields
+        ``requested_columns``, the engine's own path-to-column map. Keys that
+        are not requested paths, and any compile failure, leave the query as
+        is: the real call then reports the engine's own error.
+        """
+        order_by = query.get("order_by") or []
+        wanted = set(requested)
+        if not any(item.get("key") in wanted for item in order_by):
+            return query
+        probe = {key: value for key, value in query.items() if key not in ("order_by", "limit")}
+        try:
+            compiled = compile_fn(probe, dialect=dialect, connection=connection)
+        except Exception:  # noqa: BLE001 - the real call reports it
+            return query
+        columns = {
+            str(entry.get("requested")): str(entry.get("column"))
+            for entry in compiled.get("requested_columns") or []
+            if isinstance(entry, dict) and entry.get("requested") and entry.get("column")
+        }
+        rewritten = [{**item, "key": columns.get(item.get("key"), item.get("key"))} for item in order_by]
+        return {**query, "order_by": rewritten}
+
+    @staticmethod
+    def _label_requested_columns(
+        result: Dict[str, Any], dataset_names: Iterable[str] = ()
+    ) -> tuple[List[str], List[Dict[str, Any]]]:
+        """Name each output column after the concept path that requested it.
+
+        Dosi derives output names from the join path, so ``FlightAlert.flight.number``
+        comes back as ``flight_alerts_flight__flight_number``. The caller asked in
+        concept paths and orders by them, so the result speaks the same spelling.
+        A ``dataset.field`` request keeps the engine's name, as it does without an
+        ontology, and so does a rename that would collide with another output.
+        The SQL keeps the engine's aliases; ``requested_columns`` still links them.
+        """
+        columns = [str(column) for column in result["columns"]]
+        rows = list(result["rows"])
+        datasets = set(dataset_names)
+        labels: Dict[str, str] = {}
+        for entry in result.get("requested_columns") or []:
+            if not (isinstance(entry, dict) and entry.get("requested") and entry.get("column")):
+                continue
+            requested = str(entry["requested"])
+            if requested.split(".", 1)[0] not in datasets:
+                labels.setdefault(str(entry["column"]), requested)
+        renamed = [labels.get(column, column) for column in columns]
+        if not labels or len(set(renamed)) != len(renamed):
+            return columns, rows
+        mapping = dict(zip(columns, renamed))
+        return renamed, [{mapping.get(key, key): value for key, value in row.items()} for row in rows]
+
+    def _concept_time_dimensions(self, engine: Any, dimensions: List[str]) -> set[str]:
+        """Concept-path dimensions that name a time axis.
+
+        ``engine.dimensions()`` lists only ``dataset.field`` spellings, so a
+        concept path such as ``Delay.flight.scheduled_departure`` would never
+        receive the requested grain. The rooting concept's ``describe`` names
+        its reachable time axes.
+        """
+        if not callable(getattr(engine, "describe", None)):
+            return set()
+        dataset_names = {str(row.get("name")) for row in engine.datasets()}
+        roots = {d.split(".", 1)[0] for d in dimensions if "." in d and d.split(".", 1)[0] not in dataset_names}
+        found: set[str] = set()
+        for root in roots:
+            try:
+                detail = engine.describe(root)
+            except Exception:  # noqa: BLE001 - not a concept; the planner reports it
+                continue
+            for key in ("time_dimensions", "time_dimensions_reachable"):
+                for item in detail.get(key) or []:
+                    path = item.get("path") if isinstance(item, dict) else item
+                    if path:
+                        found.add(str(path))
+        return found & set(dimensions)
+
+    async def select(
+        self,
+        *,
+        from_concept: str,
+        fields: List[str],
+        where: Optional[str] = None,
+        order_by: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> QueryResult:
+        """Record-level (detail) query rooted on one concept; fields may be concept paths."""
+        binding = await asyncio.to_thread(load_binding)
+        _, handle = await asyncio.to_thread(self._first_answer, lambda engine: engine.describe(from_concept))
+        engine = await asyncio.to_thread(handle.get)
+        query: Dict[str, Any] = {"from": from_concept, "fields": list(fields)}
+        if where:
+            query["where_sql"] = where
+        if order_by:
+            query["order_by"] = [
+                {"key": key[1:], "desc": True} if key.startswith("-") else {"key": key, "desc": False}
+                for key in order_by
+            ]
+        if limit is not None:
+            query["limit"] = int(limit)
+        connection = handle.profile_name
+        query = await asyncio.to_thread(
+            self._order_by_requested_columns,
+            query,
+            list(fields),
+            engine.compile_select,
+            self._dry_run_dialect(binding, connection),
+            connection,
+        )
+        try:
+            result = await asyncio.to_thread(
+                engine.select,
+                query,
+                connection=connection,
+                timeout_secs=float(self.config.timeout_seconds),
+            )
+        except Exception as exc:  # noqa: BLE001 - mapped to typed errors below
+            raise_mapped(exc, binding, requested_dimensions=list(fields))
+            raise  # unreachable; raise_mapped always raises
+        metadata: Dict[str, Any] = {
+            "sql": result["sql"],
+            "dialect": result["dialect"],
+            "row_count": result["row_count"],
+        }
+        if result.get("requested_columns") is not None:
+            metadata["requested_columns"] = result["requested_columns"]
+        dataset_names = await asyncio.to_thread(lambda: [str(row.get("name")) for row in engine.datasets()])
+        columns, rows = self._label_requested_columns(result, dataset_names)
+        return QueryResult(columns=columns, data=rows, metadata=metadata)
 
     async def attribute(self, request: AttributionRequest) -> AttributionResult:
         """Delegate attribution to the native engine that owns the metric."""
@@ -758,11 +1032,7 @@ class DosiRuntime:
 
     @staticmethod
     def _document_model_names(model_path: str) -> List[str]:
-        return [
-            str(model.get("name") or "").strip()
-            for model in iter_semantic_models(load_document(model_path))
-            if str(model.get("name") or "").strip()
-        ]
+        return document_model_names(load_document(model_path))
 
     @classmethod
     def _find_model_paths(cls, model_paths: List[str], semantic_model_name: str) -> tuple[List[str], List[str]]:
@@ -996,14 +1266,16 @@ class DosiRuntime:
         *,
         dialect: Optional[str],
         connection: Optional[str],
+        required_dimensions: Optional[List[str]] = None,
     ) -> bool:
         """Ask the native planner whether a metric needs a grouped time axis."""
 
+        required_group_by = [{"field": name} for name in required_dimensions or []]
         without_axis = cls._probe_compile(
             engine,
             binding,
             metric_name,
-            [],
+            required_group_by,
             dialect=dialect,
             connection=connection,
         )
@@ -1015,7 +1287,8 @@ class DosiRuntime:
                     engine,
                     binding,
                     metric_name,
-                    [{"field": "metric_time", "grain": grain}],
+                    [{"field": "metric_time", "grain": grain}]
+                    + [item for item in required_group_by if item["field"] != "metric_time"],
                     dialect=dialect,
                     connection=connection,
                 )
@@ -1084,6 +1357,15 @@ class DosiRuntime:
         db_config = self.config.db_config or {}
         return resolve_engine_dialect(db_config.get("type"), binding.DIALECTS)
 
+    @staticmethod
+    def _query_time_dimensions(dimension_rows: List[Dict[str, Any]], dimensions: List[str]) -> set[str]:
+        time_names = {row["name"] for row in dimension_rows if row.get("is_time")}
+        return {
+            name
+            for name in dimensions
+            if name == "metric_time" or name in time_names or any(full.endswith(f".{name}") for full in time_names)
+        }
+
     def _build_query(
         self,
         dimension_rows: List[Dict[str, Any]],
@@ -1102,26 +1384,20 @@ class DosiRuntime:
     ) -> Dict[str, Any]:
         """Assemble the engine's MetricQuery dict. Pure: no engine I/O."""
         del metric_rows  # Kept for backward-compatible direct-call tests/callers.
-        time_dimension_names = {row["name"] for row in dimension_rows if row.get("is_time")}
-
-        def is_time_dimension(name: str) -> bool:
-            return (
-                name == "metric_time"
-                or name in time_dimension_names
-                or any(full.endswith(f".{name}") for full in time_dimension_names)
-            )
+        time_dimensions = self._query_time_dimensions(dimension_rows, dimensions)
 
         group_by: List[Dict[str, Any]] = []
         grain_attached = False
         requested_grain = str(time_granularity or "").strip().lower() or None
         for dimension in dimensions:
             item: Dict[str, Any] = {"field": dimension}
-            if requested_grain and is_time_dimension(dimension):
+            if requested_grain and dimension in time_dimensions:
                 item["grain"] = requested_grain
                 grain_attached = True
             group_by.append(item)
 
         if time_granularity and not grain_attached:
+            time_dimension_names = {row["name"] for row in dimension_rows if row.get("is_time")}
             model_time_dims = ["metric_time", *sorted(time_dimension_names)]
             raise SemanticValidationException(
                 SemanticValidationError(
@@ -1155,7 +1431,7 @@ class DosiRuntime:
             query["context_filter"] = context_filter
         if time_start or time_end:
             time_range: Dict[str, Any] = {"start": time_start, "end": time_end}
-            if not any(is_time_dimension(item["field"]) for item in group_by):
+            if not time_dimensions:
                 # The reserved time name lets the engine resolve each metric's
                 # effective axis and report no_primary_time_dimension or
                 # metric_time_conflict itself. The Agent must not guess from

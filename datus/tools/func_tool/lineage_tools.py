@@ -131,7 +131,9 @@ class LineageTools:
             datasource: Datasource supplying dialect and default database instead of the saved
                 settings; defaults to the active one when nothing is saved yet.
             dialect: Override the dialect, e.g. starrocks, mysql or hive.
-            default_database: Database used to qualify bare table names.
+            default_database: Database used to qualify bare table names. When the scripts qualify
+                tables with a database other than the datasource's, pass that database so bare and
+                qualified references to one table resolve to the same node.
             prune_missing: With paths, also remove saved sources matching the patterns whose files
                 no longer exist.
             rebuild: With paths, discard the saved graph and its settings, then rebuild it from
@@ -542,6 +544,11 @@ def _merge_settings(
     base: AnalysisSettings, dialect: Optional[str], default_database: Optional[str]
 ) -> AnalysisSettings:
     """``base`` with the given overrides; only a new dialect name still needs mapping to a parser."""
+    from datus.tools.db_tools import connector_registry
+
+    analyzer_getter = getattr(connector_registry, "get_sql_analyzer", None)
+    if dialect and callable(analyzer_getter) and analyzer_getter(dialect) is not None:
+        raise ValueError("Static lineage is unsupported for this adapter's limited SQL analysis path")
     return AnalysisSettings(
         dialect=parse_dialect(dialect) if dialect else base.dialect,
         default_database=default_database or base.default_database,

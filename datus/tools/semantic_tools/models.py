@@ -11,6 +11,8 @@ class DimensionInfo(BaseModel):
     """Information about a dimension."""
 
     name: str = Field(..., description="Dimension name")
+    required: bool = Field(False, description="Whether this metric always requires the dimension in group-by")
+    required_reason: Optional[str] = Field(None, description="Stable requirement reason code, e.g. 'metric_definition'")
     description: Optional[str] = Field(None, description="Dimension description")
     type: Optional[str] = Field(
         None,
@@ -20,6 +22,9 @@ class DimensionInfo(BaseModel):
     is_primary_time: Optional[bool] = Field(
         None,
         description="Whether this is the metric's canonical time dimension",
+    )
+    time_axis_required: bool = Field(
+        False, description="Whether this canonical time axis must be grouped with a time granularity"
     )
     time_granularities: List[str] = Field(
         default_factory=list,
@@ -309,6 +314,15 @@ class SemanticValidationError(BaseModel):
     )
     suggested_retry: Optional[Dict[str, Any]] = Field(
         None, description="Concrete query_metrics kwargs the caller can retry with"
+    )
+    candidates: List[str] = Field(
+        default_factory=list,
+        description="Valid alternatives the engine named, e.g. a correctly rooted concept path",
+    )
+    hint: Optional[str] = Field(None, description="Engine retry hint, e.g. the group-by to use instead")
+    detail: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Code-specific engine payload, e.g. value_not_in_domain violations with their allowed values",
     )
     message: str = Field("", description="Human-readable explanation")
 

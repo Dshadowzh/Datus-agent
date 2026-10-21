@@ -421,6 +421,7 @@ class SemanticTools:
             "query_metrics",
             "validate_semantic",
             "attribution_analyze",
+            *cls.ONTOLOGY_TOOL_NAMES,
         ]
 
     @classmethod
@@ -447,6 +448,7 @@ class SemanticTools:
         warehouse_dry_run_provider: Optional[Callable[[str], Mapping[str, Any]]] = None,
         semantic_model_path_provider: Optional[Callable[[], Optional[str]]] = None,
         semantic_metric_names_provider: Optional[Callable[[], Optional[List[str]]]] = None,
+        ontology_enabled: bool = False,
     ):
         """
         Initialize semantic function tool.
@@ -464,6 +466,11 @@ class SemanticTools:
                 request-local semantic model selected for authoring or validation.
             semantic_metric_names_provider: Optional callback returning the
                 present touched metrics that require compiled publish evidence.
+            ontology_enabled: Load the datasource's Apache Ossie ontology
+                (``subject/semantic_models/ontology/<datasource>/``) beside its
+                models and expose the ontology tools. Off for every agent that
+                does not ask for it. Mapping documents there say which model
+                each ontology binds.
         """
         self.agent_config = agent_config
         self.sub_agent_name = sub_agent_name
@@ -472,6 +479,7 @@ class SemanticTools:
         self._warehouse_dry_run_provider = warehouse_dry_run_provider
         self._semantic_model_path_provider = semantic_model_path_provider
         self._semantic_metric_names_provider = semantic_metric_names_provider
+        self.ontology_enabled = bool(ontology_enabled)
         self._runtime_db_context_static: Dict[str, str] = {}
         self._runtime_db_context_static_set = False
 
@@ -866,6 +874,10 @@ class SemanticTools:
                 semantic_models_path=str(self.agent_config.path_manager.semantic_model_path(datasource)),
                 semantic_model_path=semantic_model_path or None,
             )
+            if self.ontology_enabled:
+                runtime_config = runtime_config.model_copy(
+                    update={"ontology_dir": str(self.agent_config.path_manager.ontology_path(datasource))}
+                )
             self._runtime = DosiRuntime(runtime_config)
             self._runtime_context_key = context_key
             self._runtime_load_error = None
@@ -931,13 +943,174 @@ class SemanticTools:
         Returns:
             List of Tool objects for LLM function calling
         """
-        return [
+        tools = [
             trans_to_function_tool(self.list_metrics),
             trans_to_function_tool(self.get_metric),
             trans_to_function_tool(self.query_metrics),
             trans_to_function_tool(self.validate_semantic),
             trans_to_function_tool(self.attribution_analyze),
         ]
+        if self.ontology_enabled:
+            tools.extend(trans_to_function_tool(getattr(self, name)) for name in self.ONTOLOGY_TOOL_NAMES)
+        return tools
+
+    # ==================== Ontology tools ====================
+
+    #: Exposed only when ``ontology_enabled``; without a loaded ontology they
+    #: could only fail.
+    ONTOLOGY_TOOL_NAMES = ("describe_concept", "find_concept_paths", "select_records")
+
+    @staticmethod
+    def _semantic_failure(tool_name: str, exc: Exception) -> FuncToolResult:
+        """A failed tool call that keeps the engine's structured retry payload."""
+        payload = getattr(exc, "payload", None)
+        if payload is not None and getattr(payload, "error_type", None) == "semantic_validation_error":
+            data = payload.model_dump() if hasattr(payload, "model_dump") else dict(payload)
+            return FuncToolResult(
+                success=0,
+                error=getattr(payload, "message", "") or f"{tool_name} validation failed",
+                result=data,
+            )
+        logger.warning(f"{tool_name} failed: {exc}")
+        return FuncToolResult(success=0, error=f"{tool_name} failed: {exc}")
+
+    def describe_concept(self, name: Optional[str] = None) -> FuncToolResult:
+        """
+        Describe the ontology: the concept catalog, or one concept in full.
+
+        Omit ``name`` for the catalog: every concept with its identity, links
+        out/in, property count and whether it can root a query. Pass a concept
+        name for everything needed to query it: properties as concept paths with
+        their type, CLOSED value domain (a filter literal must be one of these
+        values) and whether they are time axes; links out with their role and
+        target; which concepts link in; the metrics it can group, with the exact
+        group-by path to use; and the time dimensions reachable from it. Every
+        path it returns can be passed as a field, dimension or filter column to
+        query_metrics and select_records.
+
+        Args:
+            name: Concept name, e.g. ``FlightAlert``. Omit for the catalog.
+
+        Returns:
+            FuncToolResult whose result is the engine's describe payload.
+        """
+        runtime, error = self._require_runtime("describe_concept")
+        if error:
+            return error
+        try:
+            return FuncToolResult(result=_run_async(runtime.describe(normalize_null(name))))
+        except Exception as exc:  # noqa: BLE001 - surfaced as a failed tool call
+            return self._semantic_failure("describe_concept", exc)
+
+    def find_concept_paths(self, source: str, target: str) -> FuncToolResult:
+        """
+        List every named path from one concept to another (up to 3 hops).
+
+        Call it when a concept is reachable more than one way, e.g. a flight
+        reaches an airport as ``arrives_at`` (role destination) and as
+        ``departs_from`` (role origin). Each path carries the roles it walks;
+        ``equivalences`` names paths the ontology declares to mean the same
+        thing, so several paths may be only one or two distinct meanings. Pick
+        the path whose role matches the question and use it as a concept path.
+
+        Args:
+            source: Concept to start from, e.g. ``Flight``.
+            target: Concept to reach, e.g. ``Airport``.
+
+        Returns:
+            FuncToolResult with ``paths`` (path, roles, hops, multiplicity),
+            ``equivalences`` and ``max_hops``.
+        """
+        source = str(source or "").strip()
+        target = str(target or "").strip()
+        if not source or not target:
+            return FuncToolResult(success=0, error="find_concept_paths requires both source and target concepts")
+        runtime, error = self._require_runtime("find_concept_paths")
+        if error:
+            return error
+        try:
+            return FuncToolResult(result=_run_async(runtime.concept_paths(source, target)))
+        except Exception as exc:  # noqa: BLE001 - surfaced as a failed tool call
+            return self._semantic_failure("find_concept_paths", exc)
+
+    #: Rows returned when the caller sets no limit; the full result is cached.
+    SELECT_RECORDS_DEFAULT_LIMIT = 200
+
+    @tool_schema(strict_mode=False)
+    def select_records(
+        self,
+        from_concept: str,
+        fields: List[str],
+        where: Optional[str] = None,
+        order_by: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> FuncToolResult:
+        """
+        Read individual records (not aggregates) of one concept.
+
+        Use it to list ids, names, statuses or other properties of matching
+        records: "which alerts are open on flights into JFK". For counts, sums,
+        averages or rates use query_metrics instead; never aggregate records by
+        hand.
+
+        Args:
+            from_concept: The concept each returned row is one record of, e.g.
+                ``FlightAlert``. Must be a concept that can root a query.
+            fields: Concept paths to return. Follow links by name to reach related
+                concepts, e.g. ``FlightAlert.flight.number`` or
+                ``FlightAlert.flight.arrives_at.name``.
+            where: Optional SQL boolean expression over concept paths, e.g.
+                ``FlightAlert.status = 'OPEN' AND FlightAlert.flight.arrives_at.code = 'JFK'``.
+                A literal compared to a property with a closed domain must be one
+                of the domain's values.
+            order_by: Optional sort keys: a requested field path (``FlightAlert.id``) or a
+                result column name; prefix with '-' for descending.
+            limit: Optional maximum number of rows (default 200).
+
+        Returns:
+            FuncToolResult with ``columns`` named by the requested field paths,
+            compressed ``data``, ``result_id`` of the cached full result, and
+            ``metadata`` (``row_count``, ``sql``, ``requested_columns`` mapping each
+            requested path to its SQL alias).
+        """
+        from_concept = str(from_concept or "").strip()
+        fields = _normalize_name_list(fields)
+        order_by = _normalize_name_list(order_by)
+        where = normalize_null(where)
+        limit = normalize_null(limit)
+        if not from_concept or not fields:
+            return FuncToolResult(success=0, error="select_records requires from_concept and at least one field")
+        runtime, error = self._require_runtime("select_records")
+        if error:
+            return error
+        try:
+            result = _run_async(
+                runtime.select(
+                    from_concept=from_concept,
+                    fields=fields,
+                    where=where,
+                    order_by=order_by or None,
+                    limit=int(limit) if limit is not None else self.SELECT_RECORDS_DEFAULT_LIMIT,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced as a failed tool call
+            return self._semantic_failure("select_records", exc)
+
+        metadata = dict(result.metadata or {})
+        cache_key = self._cache_query_metrics_result(result.columns, result.data)
+        if cache_key:
+            metadata["_full_result_cache_key"] = cache_key
+            metadata["_full_result_cached"] = True
+            metadata["_full_result_row_count"] = self._query_data_row_count(result.data)
+        compressed = self.compressor.compress(result.data, column_priority=list(result.columns))
+        return FuncToolResult(
+            result={
+                "result_id": cache_key,
+                "columns": self._visible_columns(result.columns, compressed),
+                "data": compressed,
+                "metadata": metadata,
+            }
+        )
 
     @mcp_tool()
     def list_metrics(
@@ -1118,13 +1291,12 @@ class SemanticTools:
         """
         Get full detail for one metric, including its queryable dimensions.
 
-        Use it after list_metrics has narrowed the candidates down; list_metrics
-        omits this detail because it is large and only matters per chosen metric.
+        Use an exact name from the selected model or the metric catalog.
         Describes one metric per call — issue the calls in parallel to describe
         several.
 
         Args:
-            name: Metric name to describe, exactly as returned by list_metrics
+            name: Exact metric name from the selected model or metric catalog.
             path: Optional subject tree path (e.g., ["Finance", "Revenue"])
 
         Returns:
@@ -1157,9 +1329,7 @@ class SemanticTools:
         if not name:
             return FuncToolResult(
                 success=0,
-                error=(
-                    "get_metric requires a metric name. Call list_metrics first and pass a name exactly as returned."
-                ),
+                error="get_metric requires a metric name. Use an exact name from the selected model or metric catalog.",
             )
 
         try:
@@ -1171,7 +1341,7 @@ class SemanticTools:
         if metric is None:
             return FuncToolResult(
                 success=0,
-                error=f"Unknown metric {name!r}. Call list_metrics for the available names.",
+                error=f"Unknown metric {name!r}. Check the exact names in the selected model or metric catalog.",
             )
 
         try:
@@ -1320,7 +1490,7 @@ class SemanticTools:
                 success=0,
                 error=(
                     "query_metrics requires at least one metric name. "
-                    "Call list_metrics first and pass one or more metric names exactly as returned."
+                    "Pass exact names from the selected model or metric catalog."
                 ),
             )
         if params is not None and not isinstance(params, dict):
@@ -1464,7 +1634,11 @@ class SemanticTools:
         semantic_model_name: str = "",
     ) -> FuncToolResult:
         """
-        Validate Dosi semantic models (requires runtime).
+        Check model structure, references and metric compilation (requires runtime).
+
+        This does not execute business queries or compare values against a baseline.
+        Use query_metrics for execution, or verify_semantic_outputs when available
+        for execution and numerical comparison against an explicit reference SELECT.
 
         After successful validation, the runtime is reloaded to pick up any new
         metrics or semantic model changes. This ensures that subsequent calls to
